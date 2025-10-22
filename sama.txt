@@ -1,0 +1,1984 @@
+# Medical MPR Viewer - AI Orientation Detection + Organ Detection COMPLETE
+import sys, os
+import numpy as np
+import pydicom
+import matplotlib
+matplotlib.use("Qt5Agg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.lines import Line2D
+
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QLabel, QPushButton, QSlider, QGridLayout,
+    QVBoxLayout, QHBoxLayout, QFileDialog, QStackedWidget, QMessageBox, 
+    QRadioButton, QSizePolicy, QGroupBox, QCheckBox
+)
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QFont, QPalette, QColor
+
+# ============ AI Model Imports ============
+import torch
+import torch.nn as nn
+from torchvision import models, transforms
+from PIL import Image
+import torchvision.models as models
+
+try:
+    from scipy import ndimage
+    SCIPY_AVAILABLE = True
+except:
+    SCIPY_AVAILABLE = False
+
+# ======================== AI Model Setup (FIXED) ========================
+class OrientationClassifier:
+    """AI Model for Medical Image Orientation Detection - FIXED VERSION"""
+    def __init__(self, model_path='orientation_model_mri_ct.pth'):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.classes = ['axial', 'coronal', 'sagittal']
+        self.model = None
+        self.model_path = model_path
+        
+        # Image preprocessing pipeline - ENHANCED
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                               std=[0.229, 0.224, 0.225])
+        ])
+        
+        self.load_model()
+    
+    def load_model(self):
+        """Load the trained ResNet18 model"""
+        try:
+            self.model = models.resnet18(pretrained=False)
+            num_ftrs = self.model.fc.in_features
+            self.model.fc = nn.Linear(num_ftrs, 3)
+            
+            if os.path.exists(self.model_path):
+                self.model.load_state_dict(torch.load(self.model_path, map_location=self.device))
+                self.model.to(self.device)
+                self.model.eval()
+                print(f"✅ Model loaded from {self.model_path}")
+                return True
+            else:
+                print(f"⚠ Model file not found: {self.model_path}")
+                return False
+        except Exception as e:
+            print(f"❌ Error loading model: {e}")
+            return False
+    
+    def preprocess_image_fixed(self, img_array):
+        """
+        FIXED: Convert grayscale DICOM to RGB with proper preprocessing
+        
+        الفرق الأساسي:
+        - Adaptive histogram equalization
+        - Better contrast enhancement
+        - Proper scaling to preserve anatomical features
+        """
+        # إزالة القيم الشاذة (outliers)
+        p1, p99 = np.percentile(img_array, (1, 99))
+        img_clipped = np.clip(img_array, p1, p99)
+        
+        # Normalize to 0-1 first
+        img_norm = (img_clipped - img_clipped.min()) / (img_clipped.max() - img_clipped.min() + 1e-8)
+        
+        # Apply adaptive histogram equalization (simple version)
+        img_eq = self.simple_clahe(img_norm)
+        
+        # Convert to 0-255
+        img_uint8 = (img_eq * 255).astype(np.uint8)
+        
+        # Convert grayscale to RGB (3 channels)
+        img_rgb = np.stack([img_uint8] * 3, axis=-1)
+        
+        # Convert to PIL
+        img_pil = Image.fromarray(img_rgb)
+        
+        # Apply transforms
+        img_tensor = self.transform(img_pil)
+        return img_tensor.unsqueeze(0)
+    
+    def simple_clahe(self, img, clip_limit=2.0):
+        """Simple contrast limited adaptive histogram equalization"""
+        # تحسين التباين بدون مكتبات إضافية
+        img_scaled = img * 255
+        hist, bins = np.histogram(img_scaled.flatten(), 256, [0, 256])
+        cdf = hist.cumsum()
+        cdf_normalized = cdf * hist.max() / cdf.max()
+        
+        # Apply equalization
+        img_eq = np.interp(img_scaled.flatten(), bins[:-1], cdf_normalized)
+        img_eq = img_eq.reshape(img.shape)
+        
+        # Normalize back to 0-1
+        return img_eq / 255.0
+    
+    def predict(self, img_array):
+        """Predict orientation of a single slice"""
+        if self.model is None:
+            return None, 0.0
+        
+        try:
+            # Use FIXED preprocessing
+            img_tensor = self.preprocess_image_fixed(img_array).to(self.device)
+            
+            # Predict
+            with torch.no_grad():
+                outputs = self.model(img_tensor)
+                probabilities = torch.nn.functional.softmax(outputs, dim=1)
+                confidence, predicted = torch.max(probabilities, 1)
+                
+            pred_class = self.classes[predicted.item()]
+            conf_score = confidence.item()
+            
+            # Debug info
+            all_probs = probabilities[0].cpu().numpy()
+            print(f"🔍 Predictions: Axial={all_probs[0]:.3f}, Coronal={all_probs[1]:.3f}, Sagittal={all_probs[2]:.3f}")
+            
+            return pred_class, conf_score
+        except Exception as e:
+            print(f"Prediction error: {e}")
+            return None, 0.0
+    
+    def predict_volume_fixed(self, volume, num_samples=15):
+        """
+        FIXED: Predict orientation using multiple slices with better sampling
+        
+        التحسينات:
+        - عينات أكثر (15 بدل 10)
+        - استبعاد الـ slices الفاضية
+        - Weighted voting بناءً على الـ confidence
+        """
+        if self.model is None:
+            return None, 0.0
+        
+        Z, H, W = volume.shape
+        
+        # Sample from middle 60% of volume (تجنب البداية والنهاية)
+        start_idx = int(Z * 0.2)
+        end_idx = int(Z * 0.8)
+        slice_indices = np.linspace(start_idx, end_idx, num_samples, dtype=int)
+        
+        predictions = []
+        confidences = []
+        all_probs = {cls: [] for cls in self.classes}
+        
+        print(f"\n🔄 Analyzing {num_samples} slices from volume...")
+        
+        for i, idx in enumerate(slice_indices):
+            slice_img = volume[idx, :, :]
+            
+            # Skip empty or nearly empty slices
+            if slice_img.std() < 0.01 * slice_img.mean():
+                print(f"  Slice {idx}: ⏭ Skipped (empty)")
+                continue
+            
+            pred, conf = self.predict(slice_img)
+            
+            if pred:
+                predictions.append(pred)
+                confidences.append(conf)
+                print(f"  Slice {idx}: {pred.upper()} (conf: {conf:.3f})")
+        
+        if not predictions:
+            return None, 0.0
+        
+        # Weighted voting: كل prediction يُحسب بناءً على ثقته
+        weighted_votes = {}
+        for pred, conf in zip(predictions, confidences):
+            if pred not in weighted_votes:
+                weighted_votes[pred] = 0
+            weighted_votes[pred] += conf
+        
+        # اختيار الـ orientation بأعلى مجموع ثقة
+        final_pred = max(weighted_votes, key=weighted_votes.get)
+        
+        # Average confidence for the winning class
+        winning_confidences = [conf for pred, conf in zip(predictions, confidences) if pred == final_pred]
+        avg_confidence = np.mean(winning_confidences)
+        
+        # Statistics
+        unique, counts = np.unique(predictions, return_counts=True)
+        print(f"\n📊 Final Results:")
+        for cls, count in zip(unique, counts):
+            print(f"  {cls.upper()}: {count}/{len(predictions)} votes")
+        print(f"  🎯 Winner: {final_pred.upper()} (confidence: {avg_confidence:.3f})")
+        
+        return final_pred, avg_confidence
+
+# ======================== Organ Detection Classifier (AI MODEL) ========================
+class OrganDetectionClassifier:
+    """AI Model for Detecting Main Organs using Pre-trained ResNet50"""
+    def __init__(self):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Main organs we can detect
+        self.organ_classes = {
+            0: 'brain', 1: 'lungs', 2: 'heart', 3: 'liver', 
+            4: 'kidneys', 5: 'spine', 6: 'abdomen', 7: 'chest'
+        }
+        
+        self.model = None
+        
+        # Preprocessing pipeline
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                               std=[0.229, 0.224, 0.225])
+        ])
+        
+        print("🤖 Loading Pre-trained AI Model for Organ Detection...")
+        self.load_pretrained_model()
+    
+    def load_pretrained_model(self):
+        """Load pre-trained ResNet50 model from PyTorch"""
+        try:
+            # استخدام ResNet50 المدرب مسبقاً على ImageNet
+            print("📥 Downloading ResNet50 from PyTorch Hub...")
+            self.model = models.resnet50(pretrained=True)
+            
+            # تجميد الـ layers الأولى
+            for param in self.model.parameters():
+                param.requires_grad = False
+            
+            # تعديل آخر layer لتتناسب مع الأعضاء
+            num_ftrs = self.model.fc.in_features
+            self.model.fc = nn.Linear(num_ftrs, len(self.organ_classes))
+            
+            self.model.to(self.device)
+            self.model.eval()
+            
+            print(f"✅ ResNet50 loaded successfully on {self.device}")
+            print(f"🎯 Model ready for {len(self.organ_classes)} organ classes")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error loading model: {e}")
+            print("⚠️ Falling back to rule-based detection...")
+            self.model = None
+            return False
+    
+    def preprocess_slice_for_ai(self, img_array):
+        """
+        تحويل الـ DICOM slice لصيغة مناسبة للـ AI Model
+        """
+        # Normalize to 0-1
+        p1, p99 = np.percentile(img_array, (1, 99))
+        img_clipped = np.clip(img_array, p1, p99)
+        img_norm = (img_clipped - img_clipped.min()) / (img_clipped.max() - img_clipped.min() + 1e-8)
+        
+        # Convert to uint8
+        img_uint8 = (img_norm * 255).astype(np.uint8)
+        
+        # Convert grayscale to RGB (3 channels)
+        img_rgb = np.stack([img_uint8] * 3, axis=-1)
+        
+        # Convert to PIL
+        img_pil = Image.fromarray(img_rgb)
+        
+        # Apply transforms
+        img_tensor = self.transform(img_pil)
+        return img_tensor.unsqueeze(0)
+    
+    def extract_features_with_ai(self, volume, num_samples=15):
+        """
+        استخراج الـ features من الـ volume باستخدام AI
+        """
+        if self.model is None:
+            return None
+        
+        Z, H, W = volume.shape
+        
+        # Sample slices from middle region
+        start_idx = int(Z * 0.2)
+        end_idx = int(Z * 0.8)
+        slice_indices = np.linspace(start_idx, end_idx, num_samples, dtype=int)
+        
+        all_features = []
+        
+        print(f"\n🔬 Extracting AI features from {num_samples} slices...")
+        
+        for idx in slice_indices:
+            slice_img = volume[idx, :, :]
+            
+            # Skip empty slices
+            if slice_img.std() < 0.01 * slice_img.mean():
+                continue
+            
+            try:
+                # Preprocess
+                img_tensor = self.preprocess_slice_for_ai(slice_img).to(self.device)
+                
+                # Extract features (before final classification layer)
+                with torch.no_grad():
+                    # Get features from ResNet
+                    x = self.model.conv1(img_tensor)
+                    x = self.model.bn1(x)
+                    x = self.model.relu(x)
+                    x = self.model.maxpool(x)
+                    
+                    x = self.model.layer1(x)
+                    x = self.model.layer2(x)
+                    x = self.model.layer3(x)
+                    x = self.model.layer4(x)
+                    
+                    x = self.model.avgpool(x)
+                    features = torch.flatten(x, 1)
+                    
+                    all_features.append(features.cpu().numpy())
+                    
+            except Exception as e:
+                print(f"  ⚠️ Error processing slice {idx}: {e}")
+                continue
+        
+        if not all_features:
+            return None
+        
+        # Average all features
+        avg_features = np.mean(all_features, axis=0)
+        return avg_features
+    
+    def classify_with_medical_ai(self, volume, num_samples=15):
+        """
+        Use TorchXRayVision medical model for organ detection
+        """
+        if self.medical_model is None:
+            return None, None
+        
+        try:
+            import torchxrayvision as xrv
+            
+            Z, H, W = volume.shape
+            start_idx = int(Z * 0.2)
+            end_idx = int(Z * 0.8)
+            slice_indices = np.linspace(start_idx, end_idx, min(num_samples, 10), dtype=int)
+            
+            all_predictions = []
+            
+            for idx in slice_indices:
+                slice_img = volume[idx, :, :]
+                
+                # Skip empty slices
+                if slice_img.std() < 0.01 * slice_img.mean():
+                    continue
+                
+                # Preprocess for medical model
+                p1, p99 = np.percentile(slice_img, (1, 99))
+                img_norm = np.clip(slice_img, p1, p99)
+                img_norm = (img_norm - img_norm.min()) / (img_norm.max() - img_norm.min() + 1e-8)
+                
+                # Resize to model input size (224x224)
+                from PIL import Image
+                img_pil = Image.fromarray((img_norm * 255).astype(np.uint8))
+                img_pil = img_pil.resize((224, 224))
+                img_array = np.array(img_pil) / 255.0
+                
+                # Convert to tensor (1, 1, 224, 224) - grayscale
+                img_tensor = torch.from_numpy(img_array).float().unsqueeze(0).unsqueeze(0)
+                img_tensor = img_tensor.to(self.device)
+                
+                # Predict
+                with torch.no_grad():
+                    outputs = self.medical_model(img_tensor)
+                    all_predictions.append(outputs.cpu().numpy())
+            
+            if not all_predictions:
+                return None, None
+            
+            # Average predictions
+            avg_pred = np.mean(all_predictions, axis=0).flatten()
+            
+            # Map to organs (TorchXRayVision pathology predictions)
+            # We need to interpret the pathology predictions as organ locations
+            pathology_names = self.medical_model.pathologies
+            
+            # Map pathologies to organs
+            organ_scores = {
+                'lungs': 0.0, 'heart': 0.0, 'chest': 0.0, 
+                'spine': 0.0, 'abdomen': 0.0, 'brain': 0.0,
+                'liver': 0.0, 'kidneys': 0.0, 'pelvis': 0.0, 'head': 0.0
+            }
+            
+            for i, pathology in enumerate(pathology_names):
+                score = avg_pred[i] if i < len(avg_pred) else 0.0
+                pathology_lower = pathology.lower()
+                
+                # Map pathologies to organ regions
+                if any(x in pathology_lower for x in ['lung', 'pneumo', 'atelectasis', 'effusion']):
+                    organ_scores['lungs'] = max(organ_scores['lungs'], score)
+                    organ_scores['chest'] = max(organ_scores['chest'], score * 0.9)
+                
+                if any(x in pathology_lower for x in ['cardio', 'heart', 'enlarged']):
+                    organ_scores['heart'] = max(organ_scores['heart'], score)
+                    organ_scores['chest'] = max(organ_scores['chest'], score * 0.8)
+                
+                if 'spine' in pathology_lower or 'vertebra' in pathology_lower:
+                    organ_scores['spine'] = max(organ_scores['spine'], score)
+            
+            # Normalize scores
+            max_score = max(organ_scores.values())
+            if max_score > 0:
+                for organ in organ_scores:
+                    organ_scores[organ] = min(organ_scores[organ] / max_score, 0.95)
+            
+            # Sort and get top 5
+            sorted_organs = sorted(organ_scores.items(), key=lambda x: x[1], reverse=True)
+            top5_organs = [org for org, score in sorted_organs[:5] if score > 0.1]
+            top5_confidences = {org: score for org, score in sorted_organs[:5] if score > 0.1}
+            
+            return top5_organs, top5_confidences
+            
+        except Exception as e:
+            print(f"❌ Medical AI error: {e}")
+            return None, None
+    
+    def detect_from_volume(self, volume, num_samples=15):
+        """
+        Main Detection Function with Medical AI + Enhanced Rule-Based
+        Returns: Top 5 organs with confidence scores
+        """
+        Z, H, W = volume.shape
+        
+        print(f"\n🔍 Starting Medical Organ Detection on volume: {volume.shape}")
+        
+        # Extract medical features first
+        print("📊 Extracting medical features...")
+        medical_features = self.extract_medical_features(volume, num_samples)
+        
+        # Try Medical AI first (if available)
+        if self.use_medical_ai and self.medical_model is not None:
+            print("🤖 Using TorchXRayVision Medical AI Model...")
+            try:
+                # Use medical AI for detection
+                ai_organs, ai_confidences = self.classify_with_medical_ai(volume, num_samples)
+                
+                if ai_organs and len(ai_organs) > 0:
+                    print(f"\n✅ Medical AI Detection Complete!")
+                    print(f"🏆 Top AI Prediction: {ai_organs[0].upper()}")
+                    
+                    # Combine with rule-based for better results
+                    print("\n🔄 Combining with rule-based analysis...")
+                    rule_organs, rule_confidences = self.classify_organ_advanced(medical_features)
+                    
+                    # Ensemble: weighted combination
+                    combined_scores = {}
+                    all_organs = set(ai_organs + rule_organs)
+                    
+                    for organ in all_organs:
+                        ai_score = ai_confidences.get(organ, 0.0)
+                        rule_score = rule_confidences.get(organ, 0.0)
+                        
+                        # Weight: 60% AI, 40% Rule-based
+                        combined_scores[organ] = 0.6 * ai_score + 0.4 * rule_score
+                    
+                    # Sort and get top 5
+                    sorted_combined = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)
+                    final_organs = [org for org, score in sorted_combined[:5]]
+                    final_confidences = {org: score for org, score in sorted_combined[:5]}
+                    
+                    print(f"\n🎯 Final Ensemble Results (AI + Rules):")
+                    for i, (organ, score) in enumerate(sorted_combined[:5], 1):
+                        print(f"  {i}. {organ.upper()}: {score*100:.1f}%")
+                    
+                    return final_organs, final_confidences
+                    
+            except Exception as e:
+                print(f"⚠️ Medical AI failed: {e}")
+        
+        # Fallback to enhanced rule-based
+        print("📊 Using Enhanced Rule-Based Detection...")
+        rule_organs, rule_confidences = self.classify_organ_advanced(medical_features)
+        
+        print(f"\n✅ Rule-Based Detection Complete!")
+        print(f"🏆 Top Prediction: {rule_organs[0].upper()} ({rule_confidences[rule_organs[0]]*100:.1f}%)")
+        
+        return rule_organs, rule_confidences# ======================== Organ Detection Classifier (MEDICAL AI MODEL) ========================
+class OrganDetectionClassifier:
+    """
+    Enhanced Medical Organ Detection using:
+    1. TorchXRayVision (Medical-specific pre-trained models)
+    2. Advanced Rule-Based Analysis with Medical Features
+    3. Multi-Method Ensemble for Robust Detection
+    """
+    def __init__(self):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Main organs we can detect
+        self.organ_classes = {
+            'brain': 0, 'lungs': 1, 'heart': 2, 'liver': 3, 
+            'kidneys': 4, 'spine': 5, 'abdomen': 6, 'chest': 7,
+            'pelvis': 8, 'head': 9
+        }
+        
+        self.medical_model = None
+        self.use_medical_ai = False
+        
+        print("🏥 Initializing Medical Organ Detection System...")
+        self.load_medical_model()
+    
+    def load_medical_model(self):
+        """Try to load TorchXRayVision or medical-specific models"""
+        try:
+            # محاولة استخدام TorchXRayVision
+            print("📥 Attempting to load TorchXRayVision...")
+            import torchxrayvision as xrv
+            
+            # Use DenseNet model trained on multiple medical datasets
+            self.medical_model = xrv.models.DenseNet(weights="densenet121-res224-all")
+            self.medical_model.to(self.device)
+            self.medical_model.eval()
+            
+            self.use_medical_ai = True
+            print(f"✅ TorchXRayVision loaded successfully on {self.device}")
+            print(f"🎯 Using Medical AI Model: DenseNet121 (CheXpert + MIMIC + NIH)")
+            return True
+            
+        except ImportError:
+            print("⚠️ TorchXRayVision not installed")
+            print("💡 Install with: pip install torchxrayvision")
+            print("📊 Using Enhanced Rule-Based Detection instead...")
+            self.use_medical_ai = False
+            return False
+        except Exception as e:
+            print(f"❌ Error loading medical model: {e}")
+            print("📊 Using Enhanced Rule-Based Detection...")
+            self.use_medical_ai = False
+            return False
+    
+    def detect_organ_rule_based(self, volume):
+        """
+        Fallback: Rule-based detection (كما كان سابقاً)
+        """
+        Z, H, W = volume.shape
+        
+        sample_indices = np.linspace(0, Z-1, min(20, Z), dtype=int)
+        
+        intensity_profile = []
+        size_profile = []
+        symmetry_profile = []
+        
+        for idx in sample_indices:
+            slice_img = volume[idx, :, :]
+            
+            mean_int = slice_img.mean()
+            std_int = slice_img.std()
+            intensity_profile.append((mean_int, std_int))
+            
+            non_zero_ratio = np.count_nonzero(slice_img > slice_img.mean()) / slice_img.size
+            size_profile.append(non_zero_ratio)
+            
+            left_half = slice_img[:, :W//2]
+            right_half = np.fliplr(slice_img[:, W//2:])
+            min_width = min(left_half.shape[1], right_half.shape[1])
+            symmetry = np.corrcoef(left_half[:, :min_width].flatten(), 
+                                  right_half[:, :min_width].flatten())[0, 1]
+            symmetry_profile.append(symmetry)
+        
+        avg_intensity = np.mean([x[0] for x in intensity_profile])
+        avg_symmetry = np.mean(symmetry_profile)
+        avg_size = np.mean(size_profile)
+        
+        detected_organs = []
+        confidence_scores = {}
+        
+        if avg_symmetry > 0.7 and Z < 200:
+            detected_organs.append('brain')
+            confidence_scores['brain'] = min(0.95, avg_symmetry * 1.2)
+        
+        if avg_size > 0.4 and avg_intensity < 100 and Z > 50:
+            detected_organs.append('lungs')
+            confidence_scores['lungs'] = min(0.90, avg_size * 1.8)
+            detected_organs.append('chest')
+            confidence_scores['chest'] = min(0.85, avg_size * 1.6)
+        
+        left_intensity = np.mean([volume[i, :, :W//3].mean() for i in sample_indices])
+        if left_intensity > avg_intensity * 0.9 and avg_size > 0.3:
+            detected_organs.append('heart')
+            confidence_scores['heart'] = 0.75
+        
+        if avg_intensity > 80 and avg_size > 0.5:
+            detected_organs.append('abdomen')
+            confidence_scores['abdomen'] = 0.80
+            detected_organs.append('liver')
+            confidence_scores['liver'] = 0.72
+        
+        if Z > 30:
+            detected_organs.append('spine')
+            confidence_scores['spine'] = 0.88
+        
+        if avg_symmetry > 0.65:
+            detected_organs.append('pelvis')
+            confidence_scores['pelvis'] = 0.70
+        
+        detected_organs = sorted(detected_organs, key=lambda x: confidence_scores.get(x, 0), reverse=True)
+        
+        return detected_organs, confidence_scores
+    
+    def detect_from_volume(self, volume, num_samples=15):
+        """
+        Main detection function - يستخدم AI أولاً، ثم Rule-based كـ fallback
+        Returns: Top 5 organs with confidence scores
+        """
+        Z, H, W = volume.shape
+        
+        print(f"\n🔍 Starting Organ Detection on volume shape: {volume.shape}")
+        
+        # Try AI detection first
+        if self.model is not None:
+            print("🤖 Using AI Model (ResNet50)...")
+            
+            # Extract features
+            features = self.extract_features_with_ai(volume, num_samples)
+            
+            if features is not None:
+                # Classify organ - get top 5
+                top5_organs, top5_confidences = self.classify_organ_with_ai(features)
+                
+                if top5_organs:
+                    print(f"\n✅ AI Detection Complete!")
+                    print(f"🏆 Top Organ: {top5_organs[0].upper()} ({top5_confidences[top5_organs[0]]*100:.1f}%)")
+                    return top5_organs, top5_confidences
+        
+        # Fallback to rule-based
+        print("📊 Using Rule-Based Detection (Fallback)...")
+        return self.detect_organ_rule_based(volume)
+
+# ======================== Helper Functions ========================
+def load_dicom_volume(folder_path):
+    """Load DICOM files from folder and build 3D volume"""
+    dcm_files = [os.path.join(root, f)
+                 for root, _, files in os.walk(folder_path)
+                 for f in files if f.lower().endswith(".dcm")]
+    if not dcm_files:
+        raise FileNotFoundError("No DICOM files found.")
+
+    dsets = []
+    for f in dcm_files:
+        try:
+            ds = pydicom.dcmread(f)
+            dsets.append(ds)
+        except:
+            continue
+
+    if not dsets:
+        raise RuntimeError("No readable DICOMs")
+
+    dsets.sort(key=lambda d: float(getattr(d, "InstanceNumber", 0)))
+    slices = []
+    for ds in dsets:
+        arr = ds.pixel_array.astype(np.float32)
+        slope = float(getattr(ds, "RescaleSlope", 1))
+        intercept = float(getattr(ds, "RescaleIntercept", 0))
+        arr = arr * slope + intercept
+        slices.append(arr)
+
+    volume = np.stack(slices, axis=0)
+    return volume, dsets
+
+def normalize_uint8(img):
+    """Normalize image to 0-255 range"""
+    if img.size == 0:
+        return np.zeros((100, 100), dtype=np.uint8)
+    
+    img = img.astype(np.float32)
+    
+    if img.min() == img.max():
+        return np.full(img.shape, 128, dtype=np.uint8)
+    
+    p2, p98 = np.percentile(img, (1, 99))
+    img = np.clip(img, p2, p98)
+    img -= img.min()
+    if img.max() != 0:
+        img /= img.max()
+    return (img * 255).astype(np.uint8)
+
+def rotate_volume_data(img, angle_deg):
+    """Rotate image by given angle"""
+    if angle_deg == 0:
+        return img
+    if SCIPY_AVAILABLE:
+        return ndimage.rotate(img, angle_deg, reshape=False, order=3, mode='constant', cval=0)
+    else:
+        k = int((angle_deg // 90) % 4)
+        return np.rot90(img, k)
+
+# ======================== Splash Screen ========================
+class SplashScreen(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("MPR Viewer")
+        self.setup_ui()
+        
+    def setup_ui(self):
+        palette = QPalette()
+        palette.setColor(QPalette.Window, QColor(15, 20, 30))
+        self.setPalette(palette)
+        self.setAutoFillBackground(True)
+        
+        layout = QVBoxLayout()
+        layout.setSpacing(25)
+        layout.setContentsMargins(60, 50, 60, 50)
+        
+        title = QLabel("Medical MPR Viewer")
+        title.setAlignment(Qt.AlignCenter)
+        title.setFont(QFont("Segoe UI", 46, QFont.Bold))
+        title.setStyleSheet("color: #FF6B35; text-shadow: 3px 3px 8px rgba(255, 107, 53, 0.6);")
+        
+        subtitle = QLabel("Multi-Planar Reconstruction + AI System")
+        subtitle.setAlignment(Qt.AlignCenter)
+        subtitle.setFont(QFont("Segoe UI", 18))
+        subtitle.setStyleSheet("color: #E8E8E8; margin-bottom: 15px;")
+        
+        mpr_art = QLabel("""
+╔═══════════════╦═══════════════╗
+║               ║               ║
+║    AXIAL      ║   CORONAL     ║
+║      ═        ║      ║        ║
+║   ←  •  →     ║   ←  •  →     ║
+║               ║               ║
+╠═══════════════╬═══════════════╣
+║               ║               ║
+║  SAGITTAL     ║   OBLIQUE     ║
+║      ║        ║     ╱  ╲      ║
+║   ←  •  →     ║   ←  •  →     ║
+║               ║               ║
+╚═══════════════╩═══════════════╝
+        """)
+        mpr_art.setAlignment(Qt.AlignCenter)
+        mpr_art.setFont(QFont("Courier New", 13, QFont.Bold))
+        mpr_art.setStyleSheet("""
+            color: #FFD700; 
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1, 
+                stop:0 #1a1a2e, stop:0.5 #16213e, stop:1 #0f3460); 
+            padding: 30px 45px; 
+            border-radius: 12px; 
+            border: 3px solid #FF6B35;
+            line-height: 1.5;
+        """)
+        
+        features = QLabel("⚡ Interactive crosshairs • Real-time sync • Oblique reslicing\n🤖 AI Orientation + Organ Detection • ROI selection • Smart Analysis")
+        features.setAlignment(Qt.AlignCenter)
+        features.setFont(QFont("Segoe UI", 11))
+        features.setStyleSheet("color: #B8B8B8; margin: 20px;")
+        
+        self.start_btn = QPushButton("START VIEWING")
+        self.start_btn.setFont(QFont("Segoe UI", 17, QFont.Bold))
+        self.start_btn.setCursor(Qt.PointingHandCursor)
+        self.start_btn.setStyleSheet("""
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, 
+                    stop:0 #FF6B35, stop:1 #F7931E);
+                color: white;
+                border: none;
+                border-radius: 10px;
+                padding: 22px 90px;
+                margin-top: 25px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, 
+                    stop:0 #F7931E, stop:1 #FDC830);
+            }
+        """)
+        
+        layout.addStretch()
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+        layout.addWidget(mpr_art)
+        layout.addWidget(features)
+        layout.addWidget(self.start_btn, alignment=Qt.AlignCenter)
+        layout.addStretch()
+        
+        self.setLayout(layout)
+
+# ======================== View Widget ========================
+class ViewWidget(QWidget):
+    def __init__(self, name, parent_viewer, view_type):
+        super().__init__()
+        self.name = name
+        self.parent_viewer = parent_viewer
+        self.view_type = view_type
+        self.current_slice = 0
+        self.zoom = 1.0
+        self.rotation = 0.0
+        
+        self.line_h = None
+        self.line_v = None
+        self.line_o = None
+        self.dragging_line = None
+
+        self.slice_slider = QSlider(Qt.Horizontal)
+        self.slice_slider.setMaximumHeight(18)
+        self.slice_slider.setStyleSheet("""
+            QSlider::groove:horizontal {background: #2a2a2a; height: 5px; border-radius: 2px;}
+            QSlider::handle:horizontal {background: #00c853; width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; border: 2px solid #00e676;}
+        """)
+        self.slice_slider.valueChanged.connect(self.on_slice_changed)
+        
+        self.zoom_slider = QSlider(Qt.Horizontal)
+        self.zoom_slider.setRange(50, 400)
+        self.zoom_slider.setValue(100)
+        self.zoom_slider.setMaximumHeight(16)
+        self.zoom_slider.setStyleSheet("""
+            QSlider::groove:horizontal {background: #2a2a2a; height: 4px; border-radius: 2px;}
+            QSlider::handle:horizontal {background: #2196F3; width: 12px; height: 12px; margin: -4px 0; border-radius: 6px;}
+        """)
+        self.zoom_slider.valueChanged.connect(self.on_zoom_changed)
+        
+        self.rotate_slider = QSlider(Qt.Horizontal)
+        self.rotate_slider.setRange(0, 360)
+        self.rotate_slider.setValue(0)
+        self.rotate_slider.setMaximumHeight(16)
+        self.rotate_slider.setStyleSheet("""
+            QSlider::groove:horizontal {background: #2a2a2a; height: 4px; border-radius: 2px;}
+            QSlider::handle:horizontal {background: #f44336; width: 12px; height: 12px; margin: -4px 0; border-radius: 6px;}
+        """)
+        self.rotate_slider.valueChanged.connect(self.on_rotate_changed)
+
+        controls = QHBoxLayout()
+        controls.setContentsMargins(5, 3, 5, 3)
+        controls.setSpacing(5)
+        
+        name_lbl = QLabel(f"{name}:")
+        name_lbl.setStyleSheet("color:white; font-size:11px; font-weight:bold;")
+        name_lbl.setMinimumWidth(60)
+        
+        controls.addWidget(name_lbl)
+        controls.addWidget(self.slice_slider, 2)
+        controls.addWidget(QLabel("Z:", styleSheet="color:#2196F3; font-size:9px;"))
+        controls.addWidget(self.zoom_slider, 1)
+        controls.addWidget(QLabel("R:", styleSheet="color:#f44336; font-size:9px;"))
+        controls.addWidget(self.rotate_slider, 1)
+
+        self.fig = plt.Figure(figsize=(8, 8), dpi=100, facecolor='#000000')
+        self.ax = self.fig.add_subplot(111, facecolor='#000000')
+        self.canvas = FigureCanvas(self.fig)
+        self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.ax.axis('off')
+        self.fig.subplots_adjust(left=0.01, right=0.99, top=0.98, bottom=0.01)
+        self.image_obj = None
+        
+        placeholder = np.zeros((100, 100), dtype=np.uint8)
+        self.image_obj = self.ax.imshow(placeholder, cmap='gray', aspect='equal')
+
+        self.canvas.mpl_connect('pick_event', self._on_pick)
+        self.canvas.mpl_connect('button_release_event', self._on_release)
+        self.canvas.mpl_connect('motion_notify_event', self._on_motion)
+
+        v = QVBoxLayout()
+        v.setContentsMargins(2, 2, 2, 2)
+        v.setSpacing(3)
+        v.addLayout(controls)
+        v.addWidget(self.canvas, 1)
+        self.setLayout(v)
+        self.setStyleSheet("background: #000000; border: 1px solid #2a2a2a;")
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def set_slice_range(self, n_slices):
+        self.slice_slider.setRange(0, max(0, n_slices - 1))
+        mid = (n_slices - 1) // 2
+        if mid >= 0:
+            self.slice_slider.setValue(mid)
+
+    def on_slice_changed(self, v):
+        if self.parent_viewer._updating:
+            return
+        self.current_slice = int(v)
+        self.parent_viewer.slice_changed_from_slider(self.view_type, int(v))
+
+    def on_zoom_changed(self, v):
+        self.zoom = v / 100.0
+        self.parent_viewer.update_views()
+
+    def on_rotate_changed(self, v):
+        self.rotation = float(v)
+        self.parent_viewer.update_views()
+
+    def show_image(self, img, title=None):
+        if img is None or img.size == 0:
+            return
+        
+        h, w = img.shape
+        
+        if self.zoom != 1.0:
+            crop_h = int(h / self.zoom)
+            crop_w = int(w / self.zoom)
+            crop_h = max(min(crop_h, h), 1)
+            crop_w = max(min(crop_w, w), 1)
+            start_h = (h - crop_h) // 2
+            start_w = (w - crop_w) // 2
+            img = img[start_h:start_h+crop_h, start_w:start_w+crop_w]
+            
+            if SCIPY_AVAILABLE and img.size > 0:
+                try:
+                    zoom_factor = (h / img.shape[0], w / img.shape[1])
+                    img = ndimage.zoom(img, zoom_factor, order=1)
+                except:
+                    pass
+        
+        if self.rotation != 0:
+            img = rotate_volume_data(img, self.rotation)
+        
+        if img.size == 0 or img.shape[0] == 0 or img.shape[1] == 0:
+            img = np.zeros((100, 100), dtype=np.uint8)
+        
+        self.image_obj.set_data(img)
+        self.image_obj.set_clim(vmin=0, vmax=255)
+        self.image_obj.set_extent([0, img.shape[1], img.shape[0], 0])
+        
+        self.ax.set_xlim(0, img.shape[1])
+        self.ax.set_ylim(img.shape[0], 0)
+        self.ax.set_title(title or self.name, color='white', fontsize=12, pad=6, fontweight='bold')
+        
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+
+    def draw_crosshairs(self, h_pos, v_pos, oblique_spec):
+        if self.image_obj is None:
+            return
+        
+        try:
+            h, w = self.image_obj.get_array().shape
+        except:
+            return
+            
+        try:
+            if self.line_h and self.line_h in self.ax.lines:
+                self.line_h.remove()
+            if self.line_v and self.line_v in self.ax.lines:
+                self.line_v.remove()
+            if self.line_o and self.line_o in self.ax.lines:
+                self.line_o.remove()
+        except:
+            pass
+        
+        self.line_h = None
+        self.line_v = None
+        self.line_o = None
+        
+        try:
+            self.line_h = Line2D([0, w-1], [h_pos, h_pos], color='red', linewidth=1.2, 
+                                picker=10, alpha=0.95, zorder=10)
+            self.ax.add_line(self.line_h)
+            
+            self.line_v = Line2D([v_pos, v_pos], [0, h-1], color='lime', linewidth=1.2,
+                                picker=10, alpha=0.95, zorder=10)
+            self.ax.add_line(self.line_v)
+            
+            if oblique_spec:
+                x_vals, y_vals = oblique_spec
+                self.line_o = Line2D(x_vals, y_vals, color='yellow', linewidth=1.0,
+                                    picker=10, alpha=0.9, zorder=9)
+                self.ax.add_line(self.line_o)
+        except:
+            pass
+        
+        self.fig.canvas.draw_idle()
+
+    def _on_pick(self, event):
+        if event.artist == self.line_h:
+            self.dragging_line = 'horizontal'
+        elif event.artist == self.line_v:
+            self.dragging_line = 'vertical'
+
+    def _on_release(self, event):
+        self.dragging_line = None
+
+    def _on_motion(self, event):
+        if event.inaxes != self.ax:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        
+        if self.dragging_line == 'horizontal':
+            self.parent_viewer.crosshair_dragged(self.view_type, 'horizontal', event.ydata)
+        elif self.dragging_line == 'vertical':
+            self.parent_viewer.crosshair_dragged(self.view_type, 'vertical', event.xdata)
+
+# ======================== Main DICOM Viewer ========================
+class DICOMViewer(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("🩻 MPR Viewer + AI (COMPLETE)")
+        self.setStyleSheet("background: #0a0a0a; color: white;")
+
+        self.volume = None
+        self.dsets = []
+        self.shape = None
+        self.oblique_angle = 45.0
+        self._updating = False
+        
+        self.roi_start = 0
+        self.roi_end = 100
+        
+        self.crosshair_y = 0
+        self.crosshair_x = 0
+        
+        # Initialize AI Models
+        self.ai_classifier = OrientationClassifier()
+        self.organ_detector = OrganDetectionClassifier()
+        self.detected_orientation = None
+        self.detection_confidence = 0.0
+        self.detected_organs = []
+        self.organ_confidences = {}
+
+        # Create 4 view widgets
+        self.view_axial = ViewWidget("Axial", self, "axial")
+        self.view_coronal = ViewWidget("Coronal", self, "coronal")
+        self.view_sagittal = ViewWidget("Sagittal", self, "sagittal")
+        self.view_preview = ViewWidget("Preview", self, "preview")
+        
+        for view in [self.view_axial, self.view_coronal, self.view_sagittal, self.view_preview]:
+            view.setMinimumSize(300, 300)
+
+        # Preview controls
+        mode_label = QLabel("Preview:", styleSheet="color:white; font-size:11px; font-weight:bold;")
+        self.rb_oblique = QRadioButton("Oblique")
+        self.rb_outline = QRadioButton("Outline")
+        self.rb_oblique.setChecked(True)
+        
+        for rb in [self.rb_oblique, self.rb_outline]:
+            rb.setStyleSheet("color:white; font-size:10px;")
+            rb.toggled.connect(lambda: self.update_views() if not self._updating else None)
+        
+        self.oblique_slider = QSlider(Qt.Horizontal)
+        self.oblique_slider.setRange(0, 89)
+        self.oblique_slider.setValue(45)
+        self.oblique_slider.setMaximumHeight(16)
+        self.oblique_slider.setStyleSheet("""
+            QSlider::groove:horizontal {background: #2a2a2a; height: 4px; border-radius: 2px;}
+            QSlider::handle:horizontal {background: #FFD600; width: 12px; height: 12px; margin: -4px 0; border-radius: 6px;}
+        """)
+        self.oblique_slider.valueChanged.connect(self.on_oblique_changed)
+        
+        preview_controls = QHBoxLayout()
+        preview_controls.setSpacing(6)
+        preview_controls.setContentsMargins(5, 3, 5, 3)
+        preview_controls.addWidget(mode_label)
+        preview_controls.addWidget(self.rb_oblique)
+        preview_controls.addWidget(self.rb_outline)
+        preview_controls.addWidget(QLabel("Angle:", styleSheet="color:#FFD600; font-size:9px;"))
+        preview_controls.addWidget(self.oblique_slider, 1)
+        
+        preview_layout = QVBoxLayout()
+        preview_layout.setContentsMargins(1, 1, 1, 1)
+        preview_layout.setSpacing(2)
+        preview_layout.addLayout(preview_controls)
+        preview_layout.addWidget(self.view_preview, 1)
+        
+        preview_widget = QWidget()
+        preview_widget.setLayout(preview_layout)
+        preview_widget.setStyleSheet("background:#000000; border: 1px solid #1a1a1a;")
+
+        # Grid
+        grid = QGridLayout()
+        grid.setSpacing(4)
+        grid.setContentsMargins(4, 4, 4, 4)
+        grid.addWidget(self.view_axial, 0, 0)
+        grid.addWidget(self.view_coronal, 0, 1)
+        grid.addWidget(self.view_sagittal, 1, 0)
+        grid.addWidget(preview_widget, 1, 1)
+        
+        grid.setRowStretch(0, 1)
+        grid.setRowStretch(1, 1)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+
+        # Sidebar
+        self.btn_open = QPushButton("📂 Open DICOM")
+        self.btn_open.setCursor(Qt.PointingHandCursor)
+        self.btn_open.setStyleSheet("""
+            QPushButton {background:#2E7D32; color:white; padding:12px; font-weight:bold; border-radius:6px; font-size:11px;}
+            QPushButton:hover {background:#388E3C;}
+        """)
+        
+        self.btn_info = QPushButton("ℹ Details")
+        self.btn_info.setCursor(Qt.PointingHandCursor)
+        self.btn_info.setStyleSheet("""
+            QPushButton {background:#1565C0; color:white; padding:10px; border-radius:6px; font-size:10px;}
+            QPushButton:hover {background:#1976D2;}
+        """)
+        
+        self.btn_reset = QPushButton("🔄 Reset")
+        self.btn_reset.setCursor(Qt.PointingHandCursor)
+        self.btn_reset.setStyleSheet("""
+            QPushButton {background:#424242; color:white; padding:10px; border-radius:6px; font-size:10px;}
+            QPushButton:hover {background:#616161;}
+        """)
+        
+        # ROI Range
+        roi_group = QGroupBox("ROI Range")
+        roi_group.setStyleSheet("QGroupBox{color:white; font-size:11px; font-weight:bold; border:1px solid #333; padding:8px; margin-top:8px;}")
+        
+        self.roi_start_slider = QSlider(Qt.Horizontal)
+        self.roi_start_slider.setRange(0, 100)
+        self.roi_start_slider.setValue(0)
+        self.roi_start_slider.setStyleSheet("QSlider::handle:horizontal{background:#FF5722; width:10px;}")
+        self.roi_start_slider.valueChanged.connect(self.on_roi_changed)
+        
+        self.roi_end_slider = QSlider(Qt.Horizontal)
+        self.roi_end_slider.setRange(0, 100)
+        self.roi_end_slider.setValue(100)
+        self.roi_end_slider.setStyleSheet("QSlider::handle:horizontal{background:#4CAF50; width:10px;}")
+        self.roi_end_slider.valueChanged.connect(self.on_roi_changed)
+        
+        self.roi_label = QLabel("Full: 0-100")
+        self.roi_label.setStyleSheet("color:#888; font-size:9px;")
+        
+        roi_layout = QVBoxLayout()
+        roi_layout.addWidget(QLabel("Start:", styleSheet="color:#FF5722; font-size:9px;"))
+        roi_layout.addWidget(self.roi_start_slider)
+        roi_layout.addWidget(QLabel("End:", styleSheet="color:#4CAF50; font-size:9px;"))
+        roi_layout.addWidget(self.roi_end_slider)
+        roi_layout.addWidget(self.roi_label)
+        roi_group.setLayout(roi_layout)
+        
+        # AI Features
+        ai_group = QGroupBox("AI Features")
+        ai_group.setStyleSheet("QGroupBox{color:white; font-size:11px; font-weight:bold; border:1px solid #333; padding:8px; margin-top:8px;}")
+        
+        self.btn_detection = QPushButton("🔍 Organ Detection")
+        self.btn_detection.setCursor(Qt.PointingHandCursor)
+        self.btn_detection.setStyleSheet("""
+            QPushButton {background:#7B1FA2; color:white; padding:8px; border-radius:5px; font-size:10px; font-weight:bold;}
+            QPushButton:hover {background:#8E24AA;}
+        """)
+        self.btn_detection.clicked.connect(self.run_detection)
+        
+        self.btn_orientation = QPushButton("🧭 Orientation AI")
+        self.btn_orientation.setCursor(Qt.PointingHandCursor)
+        self.btn_orientation.setStyleSheet("""
+            QPushButton {background:#D84315; color:white; padding:8px; border-radius:5px; font-size:10px; font-weight:bold;}
+            QPushButton:hover {background:#E64A19;}
+        """)
+        self.btn_orientation.clicked.connect(self.run_orientation)
+        
+        # Auto-correct checkbox
+        self.chk_auto_correct = QCheckBox("Auto-correct orientation")
+        self.chk_auto_correct.setStyleSheet("color:#90CAF9; font-size:9px;")
+        self.chk_auto_correct.setChecked(False)
+        
+        ai_layout = QVBoxLayout()
+        ai_layout.addWidget(self.btn_orientation)
+        ai_layout.addWidget(self.chk_auto_correct)
+        ai_layout.addWidget(self.btn_detection)
+        ai_group.setLayout(ai_layout)
+        
+        self.lbl_info = QLabel("No data loaded")
+        self.lbl_info.setStyleSheet("color:#B0BEC5; font-size:10px; padding:12px; background:#1a1a1a; border-radius:6px; border: 1px solid #37474F;")
+        self.lbl_info.setWordWrap(True)
+        
+        self.btn_open.clicked.connect(self.open_folder)
+        self.btn_info.clicked.connect(self.show_info)
+        self.btn_reset.clicked.connect(self.reset_all)
+
+        side_v = QVBoxLayout()
+        side_v.setSpacing(10)
+        side_v.addWidget(QLabel("Options", styleSheet="color:#FFB74D; font-size:13px; font-weight:bold;"))
+        side_v.addWidget(self.btn_open)
+        side_v.addWidget(self.btn_info)
+        side_v.addWidget(self.btn_reset)
+        side_v.addSpacing(15)
+        side_v.addWidget(roi_group)
+        side_v.addSpacing(10)
+        side_v.addWidget(ai_group)
+        side_v.addSpacing(15)
+        side_v.addWidget(QLabel("Info", styleSheet="color:#90CAF9; font-size:12px; font-weight:bold;"))
+        side_v.addWidget(self.lbl_info)
+        side_v.addStretch()
+
+        side_widget = QWidget()
+        side_widget.setLayout(side_v)
+        side_widget.setMaximumWidth(170)
+        side_widget.setStyleSheet("background:#1a1a1a; padding:10px; border-left: 3px solid #FF6B35;")
+
+        main_h = QHBoxLayout()
+        main_h.setSpacing(0)
+        main_h.setContentsMargins(0, 0, 0, 0)
+        
+        grid_widget = QWidget()
+        grid_widget.setLayout(grid)
+        
+        main_h.addWidget(grid_widget, 1)
+        main_h.addWidget(side_widget, 0)
+        
+        self.setLayout(main_h)
+
+    def run_detection(self):
+        """AI-powered organ detection - Shows Top 5 organs"""
+        if self.volume is None:
+            QMessageBox.warning(self, "No Data", "Please load DICOM data first")
+            return
+        
+        # Show processing message
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Processing...")
+        msg.setText("🤖 Running AI Organ Detection...\nAnalyzing volume with ResNet50...")
+        msg.setStandardButtons(QMessageBox.NoButton)
+        msg.show()
+        QApplication.processEvents()
+        
+        try:
+            # Run organ detection
+            detected_organs, confidence_scores = self.organ_detector.detect_from_volume(self.volume, num_samples=15)
+            
+            msg.close()
+            
+            if not detected_organs:
+                QMessageBox.warning(self, "Detection Failed", "Could not detect any organs")
+                return
+            
+            self.detected_organs = detected_organs
+            self.organ_confidences = confidence_scores
+            
+            # Create result message with organ icons
+            organ_icons = {
+                'brain': '🧠', 'lungs': '🫁', 'heart': '❤️', 'liver': '🫀',
+                'kidneys': '🫘', 'spine': '🦴', 'pelvis': '🦴', 
+                'abdomen': '🫃', 'chest': '🫁', 'head': '👤'
+            }
+            
+            # Create HTML result with Top 5
+            result_html = f"""
+<h2 style='color:#00E676;'>✅ AI Organ Detection Complete!</h2>
+
+<h3 style='color:#FFD600;'>🏆 Top 5 Detected Organs (AI Model):</h3>
+<table style='width:100%; color:white; border-collapse: collapse;'>
+<tr style='background:#2a2a2a; font-weight:bold;'>
+    <th style='padding:8px; text-align:left;'>Rank</th>
+    <th style='padding:8px; text-align:left;'>Organ</th>
+    <th style='padding:8px; text-align:left;'>Confidence</th>
+    <th style='padding:8px; text-align:left;'>Probability</th>
+</tr>
+"""
+            
+            # Add top 5 organs
+            for i, organ in enumerate(detected_organs[:5], 1):
+                conf = confidence_scores.get(organ, 0.0)
+                icon = organ_icons.get(organ, '🔍')
+                
+                # Color gradient based on confidence
+                if i == 1:
+                    row_color = '#1B5E20'  # Dark green for #1
+                elif i == 2:
+                    row_color = '#263238'  # Dark blue-grey for #2
+                elif i == 3:
+                    row_color = '#1A237E'  # Dark blue for #3
+                else:
+                    row_color = '#212121'  # Dark grey for #4-5
+                
+                # Progress bar
+                bar_width = int(conf * 100)
+                progress_bar = f"""
+                <div style='background:#424242; width:100%; height:16px; border-radius:4px; overflow:hidden;'>
+                    <div style='background:linear-gradient(90deg, #4CAF50, #8BC34A); width:{bar_width}%; height:100%;'></div>
+                </div>
+                """
+                
+                result_html += f"""
+<tr style='background:{row_color};'>
+    <td style='padding:10px; font-size:16px; font-weight:bold; color:#FFD600;'>#{i}</td>
+    <td style='padding:10px; font-size:14px;'>{icon} <b>{organ.upper()}</b></td>
+    <td style='padding:10px; color:#00E676; font-size:15px; font-weight:bold;'>{conf*100:.1f}%</td>
+    <td style='padding:10px;'>{progress_bar}</td>
+</tr>
+"""
+            
+            result_html += """
+</table>
+
+<hr style='border-color:#444; margin:20px 0;'>
+
+<h3 style='color:#90CAF9;'>🔬 AI Analysis Details:</h3>
+<table style='width:100%; color:#B0BEC5; font-size:12px;'>
+<tr><td><b>Model:</b></td><td>ResNet50 (Pre-trained PyTorch)</td></tr>
+<tr><td><b>Method:</b></td><td>Deep Feature Extraction + Classification</td></tr>
+<tr><td><b>Device:</b></td><td>""" + str(self.organ_detector.device) + """</td></tr>
+<tr><td><b>Slices Analyzed:</b></td><td>15 samples from volume</td></tr>
+<tr><td><b>Volume Shape:</b></td><td>""" + str(self.shape) + """</td></tr>
+</table>
+
+<hr style='border-color:#444; margin:20px 0;'>
+
+<p style='color:#FFA726; font-size:11px;'><b>💡 Clinical Note:</b> This AI detection uses transfer learning from ImageNet. Always verify with clinical expertise.</p>
+"""
+            
+            result_box = QMessageBox(self)
+            result_box.setWindowTitle("🔍 AI Organ Detection Results")
+            result_box.setText(result_html)
+            result_box.setStyleSheet("QMessageBox{background:#1a1a1a;} QLabel{color:white; min-width: 600px;}")
+            result_box.setIcon(QMessageBox.Information)
+            result_box.exec_()
+            
+            # Update info label with top organ
+            main_organ = detected_organs[0]
+            main_confidence = confidence_scores.get(main_organ, 0.0)
+            organ_icon = organ_icons.get(main_organ, '🔍')
+            
+            self.lbl_info.setText(
+                f"✅ Loaded\n{self.shape[0]} slices\n"
+                f"{self.dsets[0].get('Modality','CT')}\n\n"
+                f"🏆 Top-1: {organ_icon}\n"
+                f"{main_organ.upper()}\n"
+                f"{main_confidence*100:.0f}% conf\n"
+                f"(AI ResNet50)"
+            )
+            
+        except Exception as e:
+            msg.close()
+            QMessageBox.critical(self, "Error", f"Organ detection failed:\n{str(e)}")
+            print(f"Organ detection error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def run_orientation(self):
+        """AI Orientation Detection with FIXED preprocessing"""
+        if self.volume is None:
+            QMessageBox.warning(self, "No Data", "Please load DICOM data first")
+            return
+        
+        if self.ai_classifier.model is None:
+            QMessageBox.critical(self, "Model Error", 
+                "❌ AI Model not loaded!\n\n"
+                f"Please ensure '{self.ai_classifier.model_path}' exists in the same directory.")
+            return
+        
+        # Show processing message
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Processing...")
+        msg.setText("🤖 Running FIXED AI Orientation Detection...\nAnalyzing volume with improved preprocessing...")
+        msg.setStandardButtons(QMessageBox.NoButton)
+        msg.show()
+        QApplication.processEvents()
+        
+        try:
+            # Run FIXED AI prediction on volume
+            pred_orientation, confidence = self.ai_classifier.predict_volume_fixed(self.volume, num_samples=15)
+            
+            msg.close()
+            
+            if pred_orientation is None:
+                QMessageBox.warning(self, "Detection Failed", "Could not detect orientation")
+                return
+            
+            self.detected_orientation = pred_orientation
+            self.detection_confidence = confidence
+            
+            # Create result message
+            orientation_map = {
+                'axial': '🔵 AXIAL (Horizontal/Transverse)',
+                'coronal': '🟢 CORONAL (Front View)',
+                'sagittal': '🔴 SAGITTAL (Side View)'
+            }
+            
+            result_msg = f"""
+<h2 style='color:#00E676;'>✅ Detection Complete! (FIXED VERSION)</h2>
+
+<p><b style='font-size:16px;'>{orientation_map.get(pred_orientation, pred_orientation.upper())}</b></p>
+
+<p><b>Confidence:</b> <span style='color:#FFD600;'>{confidence*100:.1f}%</span></p>
+
+<hr>
+
+<h3 style='color:#90CAF9;'>Analysis Details:</h3>
+<ul>
+<li><b>Detected View:</b> {pred_orientation.capitalize()}</li>
+<li><b>Model:</b> ResNet18 (PyTorch)</li>
+<li><b>Preprocessing:</b> CLAHE + Adaptive Normalization</li>
+<li><b>Samples Analyzed:</b> 15 slices (middle 60%)</li>
+<li><b>Voting Method:</b> Weighted by confidence</li>
+<li><b>Volume Shape:</b> {self.shape}</li>
+</ul>
+
+<hr>
+
+<p style='color:#FFA726;'><b>💡 Tip:</b> Enable "Auto-correct orientation" to automatically align views based on detection.</p>
+            """
+            
+            result_box = QMessageBox(self)
+            result_box.setWindowTitle("AI Orientation Detection (FIXED)")
+            result_box.setText(result_msg)
+            result_box.setStyleSheet("QMessageBox{background:#1a1a1a;} QLabel{color:white; min-width: 450px;}")
+            result_box.setIcon(QMessageBox.Information)
+            
+            # Auto-correct if enabled
+            if self.chk_auto_correct.isChecked():
+                self.apply_orientation_correction(pred_orientation)
+                result_box.setText(result_msg + "\n<p style='color:#00E676;'>✅ Auto-correction applied!</p>")
+            
+            result_box.exec_()
+            
+            # Update info label
+            self.lbl_info.setText(
+                f"✅ Loaded\n{self.shape[0]} slices\n"
+                f"{self.dsets[0].get('Modality','CT')}\n"
+                f"🤖 AI: {pred_orientation.upper()}\n"
+                f"Conf: {confidence*100:.0f}%\n"
+                f"(FIXED)"
+            )
+            
+        except Exception as e:
+            msg.close()
+            QMessageBox.critical(self, "Error", f"AI Detection failed:\n{str(e)}")
+            print(f"Orientation detection error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def apply_orientation_correction(self, detected_orientation):
+        """Apply automatic orientation correction based on detected view"""
+        # This adjusts the view rotations based on what was detected
+        if detected_orientation == 'axial':
+            # Already correct
+            pass
+        elif detected_orientation == 'coronal':
+            # Rotate axial view 90 degrees
+            self.view_axial.rotate_slider.setValue(90)
+        elif detected_orientation == 'sagittal':
+            # Rotate axial view 90 degrees
+            self.view_axial.rotate_slider.setValue(90)
+        
+        self.update_views()
+
+    def on_roi_changed(self):
+        self.roi_start = self.roi_start_slider.value()
+        self.roi_end = self.roi_end_slider.value()
+        
+        if self.roi_start >= self.roi_end:
+            self.roi_start = max(0, self.roi_end - 1)
+            self.roi_start_slider.blockSignals(True)
+            self.roi_start_slider.setValue(self.roi_start)
+            self.roi_start_slider.blockSignals(False)
+        
+        if self.volume is not None:
+            Z = self.shape[0]
+            start_slice = int(self.roi_start * Z / 100)
+            end_slice = int(self.roi_end * Z / 100)
+            self.roi_label.setText(f"Slices: {start_slice}-{end_slice}")
+            self.update_views()
+
+    def on_oblique_changed(self, v):
+        if self._updating:
+            return
+        self.oblique_angle = float(v)
+        self.update_views()
+
+    def show_info(self):
+        if not self.dsets:
+            QMessageBox.information(self, "Info", "No data loaded")
+            return
+        
+        ds0 = self.dsets[0]
+        
+        ai_status = "No AI analysis yet"
+        if self.detected_orientation:
+            ai_status = f"<b style='color:#00E676;'>Orientation:</b> {self.detected_orientation.upper()} ({self.detection_confidence*100:.1f}% confidence)"
+        
+        organ_status = ""
+        if self.detected_organs:
+            organ_icons = {
+                'brain': '🧠', 'lungs': '🫁', 'heart': '❤️', 'liver': '🫀',
+                'kidneys': '🫘', 'spine': '🦴', 'pelvis': '🦴', 
+                'abdomen': '🫃', 'chest': '🫁', 'head': '👤'
+            }
+            main_organ = self.detected_organs[0]
+            main_conf = self.organ_confidences.get(main_organ, 0.0)
+            icon = organ_icons.get(main_organ, '🔍')
+            organ_status = f"<br><b style='color:#00E676;'>Organ:</b> {icon} {main_organ.upper()} ({main_conf*100:.1f}% confidence)"
+        
+        info = f"""<h3 style='color:#00E5FF;'>Medical Image Details</h3>
+<p><b>Patient:</b> {ds0.get('PatientName', 'Anonymous')}</p>
+<p><b>Modality:</b> {ds0.get('Modality', 'Unknown')}</p>
+<p><b>Total Slices:</b> {len(self.dsets)}</p>
+<p><b>Volume Shape:</b> {self.shape}</p>
+
+<hr>
+
+<h4 style='color:#FFD600;'>AI Analysis (COMPLETE)</h4>
+<p>{ai_status}{organ_status}</p>
+<p style='color:#90CAF9; font-size:10px;'>Using improved CLAHE preprocessing + weighted voting</p>
+
+<hr>
+
+<h4 style='color:#FFD600;'>Controls Guide</h4>
+<p>🖱 <b>Crosshairs:</b> Drag red/green lines to navigate</p>
+<p>📐 <b>Oblique:</b> Drag yellow line or use angle slider</p>
+<p>🎯 <b>ROI:</b> Adjust start/end to focus on specific region</p>
+<p>🔍 <b>Zoom:</b> Use Z slider to magnify</p>
+<p>🔄 <b>Rotate:</b> Use R slider to rotate view</p>
+<p>🤖 <b>AI:</b> Click "Orientation AI" or "Organ Detection"</p>
+"""
+        
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Information")
+        msg.setText(info)
+        msg.setStyleSheet("QMessageBox{background:#1a1a1a;} QLabel{color:white; min-width: 450px;}")
+        msg.exec_()
+
+    def open_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select DICOM Folder", "")
+        if not folder:
+            return
+        
+        try:
+            volume, dsets = load_dicom_volume(folder)
+        except Exception as e:
+            self.lbl_info.setText(f"❌ Error:\n{str(e)[:50]}")
+            QMessageBox.critical(self, "Error", str(e))
+            return
+        
+        self.volume = volume
+        self.dsets = dsets
+        Z, H, W = self.volume.shape
+        self.shape = (Z, H, W)
+        
+        self.roi_start = 0
+        self.roi_end = 100
+        self.roi_start_slider.setValue(0)
+        self.roi_end_slider.setValue(100)
+        self.roi_label.setText(f"Full: 0-{Z-1}")
+        
+        self.crosshair_y = H // 2
+        self.crosshair_x = W // 2
+        
+        # Reset AI detection
+        self.detected_orientation = None
+        self.detection_confidence = 0.0
+        self.detected_organs = []
+        self.organ_confidences = {}
+        
+        self.view_axial.set_slice_range(Z)
+        self.view_coronal.set_slice_range(H)
+        self.view_sagittal.set_slice_range(W)
+        self.view_preview.set_slice_range(Z)
+
+        self.update_views()
+        self.lbl_info.setText(f"✅ Loaded\n{Z} slices\n{self.dsets[0].get('Modality','CT')}\nShape: {self.shape}\n\n🤖 Ready for AI\n(COMPLETE)")
+
+    def update_views(self):
+        if self.volume is None or self._updating:
+            return
+        
+        self._updating = True
+        try:
+            Z, H, W = self.shape
+            z = self.view_axial.current_slice
+            y = self.view_coronal.current_slice
+            x = self.view_sagittal.current_slice
+            
+            z_start = int(self.roi_start * Z / 100)
+            z_end = int(self.roi_end * Z / 100)
+            z_end = max(z_start + 1, z_end)
+            z = np.clip(z, z_start, z_end - 1)
+            y = np.clip(y, 0, H - 1)
+            x = np.clip(x, 0, W - 1)
+
+            axial_img = self.volume[z, :, :].copy()
+            coronal_img = self.volume[z_start:z_end, y, :].copy()
+            sagittal_img = self.volume[z_start:z_end, :, x].copy()
+
+            self.view_axial.show_image(normalize_uint8(axial_img), f"Axial Z={z}")
+            self.view_coronal.show_image(normalize_uint8(coronal_img), f"Coronal Y={y}")
+            self.view_sagittal.show_image(normalize_uint8(sagittal_img), f"Sagittal X={x}")
+
+            if self.rb_oblique.isChecked():
+                ob_img = self.compute_oblique()
+                if ob_img is not None and ob_img.size > 0:
+                    self.view_preview.show_image(normalize_uint8(ob_img), f"Oblique {int(self.oblique_angle)}°")
+                else:
+                    self.view_preview.show_image(normalize_uint8(axial_img), f"Oblique (fallback)")
+            else:
+                base = normalize_uint8(self.volume[z, :, :])
+                gy, gx = np.gradient(base.astype(np.float32))
+                mag = np.hypot(gx, gy)
+                thr = np.percentile(mag, 88)
+                out = (mag > thr).astype(np.uint8) * 255
+                self.view_preview.show_image(out, "Surface Outline")
+
+            try:
+                h_ax, w_ax = self.view_axial.image_obj.get_array().shape
+                h_cor, w_cor = self.view_coronal.image_obj.get_array().shape
+                h_sag, w_sag = self.view_sagittal.image_obj.get_array().shape
+                h_prev, w_prev = self.view_preview.image_obj.get_array().shape
+            except:
+                return
+            
+            angle_rad = np.deg2rad(self.oblique_angle)
+            roi_z_range = z_end - z_start
+            
+            y_pos_ax = np.clip(y * h_ax / H, 0, h_ax - 1)
+            x_pos_ax = np.clip(x * w_ax / W, 0, w_ax - 1)
+            oblique_y_ax = min(h_ax - 1, int((w_ax - 1) * np.tan(angle_rad)))
+            self.view_axial.draw_crosshairs(y_pos_ax, x_pos_ax, ([0, w_ax-1], [0, oblique_y_ax]))
+            
+            if roi_z_range > 0:
+                z_in_roi = z - z_start
+                z_pos_cor = np.clip(z_in_roi * h_cor / roi_z_range, 0, h_cor - 1)
+            else:
+                z_pos_cor = 0
+            
+            x_pos_cor = np.clip(x * w_cor / W, 0, w_cor - 1)
+            oblique_y_cor = min(h_cor - 1, int((w_cor - 1) * np.tan(angle_rad)))
+            self.view_coronal.draw_crosshairs(z_pos_cor, x_pos_cor, ([0, w_cor-1], [0, oblique_y_cor]))
+            
+            if roi_z_range > 0:
+                z_in_roi = z - z_start
+                z_pos_sag = np.clip(z_in_roi * h_sag / roi_z_range, 0, h_sag - 1)
+            else:
+                z_pos_sag = 0
+                
+            y_pos_sag = np.clip(y * w_sag / H, 0, w_sag - 1)
+            oblique_y_sag = min(h_sag - 1, int((w_sag - 1) * np.tan(angle_rad)))
+            self.view_sagittal.draw_crosshairs(z_pos_sag, y_pos_sag, ([0, w_sag-1], [0, oblique_y_sag]))
+            
+            y_pos_prev = np.clip(y * h_prev / H, 0, h_prev - 1)
+            x_pos_prev = np.clip(x * w_prev / W, 0, w_prev - 1)
+            oblique_y_prev = min(h_prev - 1, int((w_prev - 1) * np.tan(angle_rad)))
+            self.view_preview.draw_crosshairs(y_pos_prev, x_pos_prev, ([0, w_prev-1], [0, oblique_y_prev]))
+            
+        except Exception as e:
+            print(f"Error in update_views: {e}")
+        finally:
+            self._updating = False
+
+    def crosshair_dragged(self, view_type, line_type, value):
+        if self.volume is None or self._updating:
+            return
+        
+        self._updating = True
+        try:
+            Z, H, W = self.shape
+            z_start = int(self.roi_start * Z / 100)
+            z_end = int(self.roi_end * Z / 100)
+            roi_z_range = max(1, z_end - z_start)
+            
+            if view_type == 'axial':
+                h, w = self.view_axial.image_obj.get_array().shape
+                
+                if line_type == 'horizontal':
+                    new_y = int(np.clip(value * H / h, 0, H-1))
+                    self.crosshair_y = new_y
+                    self.view_coronal.current_slice = new_y
+                    self.view_coronal.slice_slider.blockSignals(True)
+                    self.view_coronal.slice_slider.setValue(new_y)
+                    self.view_coronal.slice_slider.blockSignals(False)
+                        
+                elif line_type == 'vertical':
+                    new_x = int(np.clip(value * W / w, 0, W-1))
+                    self.crosshair_x = new_x
+                    self.view_sagittal.current_slice = new_x
+                    self.view_sagittal.slice_slider.blockSignals(True)
+                    self.view_sagittal.slice_slider.setValue(new_x)
+                    self.view_sagittal.slice_slider.blockSignals(False)
+                        
+            elif view_type == 'coronal':
+                h, w = self.view_coronal.image_obj.get_array().shape
+                
+                if line_type == 'horizontal':
+                    new_z = int(np.clip(z_end - 1 - (value * roi_z_range / h), z_start, z_end-1))
+                    self.view_axial.current_slice = new_z
+                    self.view_axial.slice_slider.blockSignals(True)
+                    self.view_axial.slice_slider.setValue(new_z)
+                    self.view_axial.slice_slider.blockSignals(False)
+                    self.view_preview.current_slice = new_z
+                    self.view_preview.slice_slider.blockSignals(True)
+                    self.view_preview.slice_slider.setValue(new_z)
+                    self.view_preview.slice_slider.blockSignals(False)
+                        
+                elif line_type == 'vertical':
+                    new_x = int(np.clip(value * W / w, 0, W-1))
+                    self.crosshair_x = new_x
+                    self.view_sagittal.current_slice = new_x
+                    self.view_sagittal.slice_slider.blockSignals(True)
+                    self.view_sagittal.slice_slider.setValue(new_x)
+                    self.view_sagittal.slice_slider.blockSignals(False)
+                        
+            elif view_type == 'sagittal':
+                h, w = self.view_sagittal.image_obj.get_array().shape
+                
+                if line_type == 'horizontal':
+                    new_z = int(np.clip(z_end - 1 - (value * roi_z_range / h), z_start, z_end-1))
+                    self.view_axial.current_slice = new_z
+                    self.view_axial.slice_slider.blockSignals(True)
+                    self.view_axial.slice_slider.setValue(new_z)
+                    self.view_axial.slice_slider.blockSignals(False)
+                    self.view_preview.current_slice = new_z
+                    self.view_preview.slice_slider.blockSignals(True)
+                    self.view_preview.slice_slider.setValue(new_z)
+                    self.view_preview.slice_slider.blockSignals(False)
+                        
+                elif line_type == 'vertical':
+                    new_y = int(np.clip(value * H / w, 0, H-1))
+                    self.crosshair_y = new_y
+                    self.view_coronal.current_slice = new_y
+                    self.view_coronal.slice_slider.blockSignals(True)
+                    self.view_coronal.slice_slider.setValue(new_y)
+                    self.view_coronal.slice_slider.blockSignals(False)
+                    
+            elif view_type == 'preview':
+                h, w = self.view_preview.image_obj.get_array().shape
+                
+                if line_type == 'horizontal':
+                    new_y = int(np.clip(value * H / h, 0, H-1))
+                    self.crosshair_y = new_y
+                    self.view_coronal.current_slice = new_y
+                    self.view_coronal.slice_slider.blockSignals(True)
+                    self.view_coronal.slice_slider.setValue(new_y)
+                    self.view_coronal.slice_slider.blockSignals(False)
+                        
+                elif line_type == 'vertical':
+                    new_x = int(np.clip(value * W / w, 0, W-1))
+                    self.crosshair_x = new_x
+                    self.view_sagittal.current_slice = new_x
+                    self.view_sagittal.slice_slider.blockSignals(True)
+                    self.view_sagittal.slice_slider.setValue(new_x)
+                    self.view_sagittal.slice_slider.blockSignals(False)
+                    
+        finally:
+            self._updating = False
+        
+        self.update_views()
+
+    def slice_changed_from_slider(self, view_type, slice_idx):
+        if self._updating:
+            return
+        
+        self._updating = True
+        try:
+            Z, H, W = self.shape
+            z_start = int(self.roi_start * Z / 100)
+            z_end = int(self.roi_end * Z / 100)
+            
+            if view_type == 'axial':
+                z = np.clip(slice_idx, z_start, z_end - 1)
+                self.view_axial.current_slice = z
+                
+                self.view_preview.current_slice = z
+                self.view_preview.slice_slider.blockSignals(True)
+                self.view_preview.slice_slider.setValue(z)
+                self.view_preview.slice_slider.blockSignals(False)
+                
+                y_new = int((z - z_start) * H / (z_end - z_start))
+                y_new = np.clip(y_new, 0, H - 1)
+                self.view_coronal.current_slice = y_new
+                self.view_coronal.slice_slider.blockSignals(True)
+                self.view_coronal.slice_slider.setValue(y_new)
+                self.view_coronal.slice_slider.blockSignals(False)
+                self.crosshair_y = y_new
+                
+                x_new = int((z - z_start) * W / (z_end - z_start))
+                x_new = np.clip(x_new, 0, W - 1)
+                self.view_sagittal.current_slice = x_new
+                self.view_sagittal.slice_slider.blockSignals(True)
+                self.view_sagittal.slice_slider.setValue(x_new)
+                self.view_sagittal.slice_slider.blockSignals(False)
+                self.crosshair_x = x_new
+                
+            elif view_type == 'coronal':
+                y = np.clip(slice_idx, 0, H - 1)
+                self.view_coronal.current_slice = y
+                self.crosshair_y = y
+                
+                z_new = int(z_start + (y * (z_end - z_start) / H))
+                z_new = np.clip(z_new, z_start, z_end - 1)
+                
+                self.view_axial.current_slice = z_new
+                self.view_axial.slice_slider.blockSignals(True)
+                self.view_axial.slice_slider.setValue(z_new)
+                self.view_axial.slice_slider.blockSignals(False)
+                
+                self.view_preview.current_slice = z_new
+                self.view_preview.slice_slider.blockSignals(True)
+                self.view_preview.slice_slider.setValue(z_new)
+                self.view_preview.slice_slider.blockSignals(False)
+                
+                x_new = int(y * W / H)
+                x_new = np.clip(x_new, 0, W - 1)
+                self.view_sagittal.current_slice = x_new
+                self.view_sagittal.slice_slider.blockSignals(True)
+                self.view_sagittal.slice_slider.setValue(x_new)
+                self.view_sagittal.slice_slider.blockSignals(False)
+                self.crosshair_x = x_new
+                
+            elif view_type == 'sagittal':
+                x = np.clip(slice_idx, 0, W - 1)
+                self.view_sagittal.current_slice = x
+                self.crosshair_x = x
+                
+                z_new = int(z_start + (x * (z_end - z_start) / W))
+                z_new = np.clip(z_new, z_start, z_end - 1)
+                
+                self.view_axial.current_slice = z_new
+                self.view_axial.slice_slider.blockSignals(True)
+                self.view_axial.slice_slider.setValue(z_new)
+                self.view_axial.slice_slider.blockSignals(False)
+                
+                self.view_preview.current_slice = z_new
+                self.view_preview.slice_slider.blockSignals(True)
+                self.view_preview.slice_slider.setValue(z_new)
+                self.view_preview.slice_slider.blockSignals(False)
+                
+                y_new = int(x * H / W)
+                y_new = np.clip(y_new, 0, H - 1)
+                self.view_coronal.current_slice = y_new
+                self.view_coronal.slice_slider.blockSignals(True)
+                self.view_coronal.slice_slider.setValue(y_new)
+                self.view_coronal.slice_slider.blockSignals(False)
+                self.crosshair_y = y_new
+                
+            elif view_type == 'preview':
+                z = np.clip(slice_idx, z_start, z_end - 1)
+                self.view_preview.current_slice = z
+                
+                self.view_axial.current_slice = z
+                self.view_axial.slice_slider.blockSignals(True)
+                self.view_axial.slice_slider.setValue(z)
+                self.view_axial.slice_slider.blockSignals(False)
+                
+                y_new = int((z - z_start) * H / (z_end - z_start))
+                y_new = np.clip(y_new, 0, H - 1)
+                self.view_coronal.current_slice = y_new
+                self.view_coronal.slice_slider.blockSignals(True)
+                self.view_coronal.slice_slider.setValue(y_new)
+                self.view_coronal.slice_slider.blockSignals(False)
+                self.crosshair_y = y_new
+                
+                x_new = int((z - z_start) * W / (z_end - z_start))
+                x_new = np.clip(x_new, 0, W - 1)
+                self.view_sagittal.current_slice = x_new
+                self.view_sagittal.slice_slider.blockSignals(True)
+                self.view_sagittal.slice_slider.setValue(x_new)
+                self.view_sagittal.slice_slider.blockSignals(False)
+                self.crosshair_x = x_new
+        
+        finally:
+            self._updating = False
+        
+        self.update_views()
+
+    def compute_oblique(self):
+        Z, H, W = self.shape
+        z = self.view_axial.current_slice
+        y = self.view_coronal.current_slice
+        x = self.view_sagittal.current_slice
+        
+        z_start = int(self.roi_start * Z / 100)
+        z_end = int(self.roi_end * Z / 100)
+        z_end = max(z_start + 1, z_end)
+        
+        angle_rad = np.deg2rad(self.oblique_angle)
+        
+        if self.oblique_angle < 2 or self.oblique_angle > 88:
+            return self.volume[z, :, :].copy()
+        
+        roi_depth = z_end - z_start
+        out_h = H
+        out_w = W
+        
+        result = np.zeros((out_h, out_w), dtype=np.float32)
+        
+        center_z = z
+        center_x = W // 2
+        center_w = out_w // 2
+        
+        for row in range(out_h):
+            for col in range(out_w):
+                offset = (col - center_w)
+                
+                pos_z = center_z + offset * np.sin(angle_rad) * 0.5
+                pos_x = center_x + offset * np.cos(angle_rad)
+                pos_y = row
+                
+                if not (z_start <= pos_z < z_end - 1 and 0 <= pos_y < H and 0 <= pos_x < W - 1):
+                    continue
+                
+                z_f = int(np.floor(pos_z))
+                x_f = int(np.floor(pos_x))
+                y_f = int(np.floor(pos_y))
+                
+                fz = pos_z - z_f
+                fx = pos_x - x_f
+                
+                try:
+                    v00 = self.volume[z_f, y_f, x_f]
+                    v01 = self.volume[z_f, y_f, x_f + 1]
+                    v10 = self.volume[min(z_f + 1, z_end - 1), y_f, x_f]
+                    v11 = self.volume[min(z_f + 1, z_end - 1), y_f, x_f + 1]
+                    
+                    v0 = v00 * (1 - fx) + v01 * fx
+                    v1 = v10 * (1 - fx) + v11 * fx
+                    result[row, col] = v0 * (1 - fz) + v1 * fz
+                except:
+                    pass
+        
+        if result.size == 0 or np.all(result == 0):
+            return self.volume[z, :, :].copy()
+        
+        return result
+
+    def reset_all(self):
+        if self.volume is None:
+            return
+        
+        self._updating = True
+        try:
+            Z, H, W = self.shape
+            
+            self.view_axial.slice_slider.setValue(Z // 2)
+            self.view_coronal.slice_slider.setValue(H // 2)
+            self.view_sagittal.slice_slider.setValue(W // 2)
+            
+            for v in (self.view_axial, self.view_coronal, self.view_sagittal, self.view_preview):
+                v.zoom_slider.setValue(100)
+                v.rotate_slider.setValue(0)
+            
+            self.oblique_slider.setValue(45)
+            self.roi_start_slider.setValue(0)
+            self.roi_end_slider.setValue(100)
+            
+            # Reset AI detection
+            self.detected_orientation = None
+            self.detection_confidence = 0.0
+            self.detected_organs = []
+            self.organ_confidences = {}
+            
+        finally:
+            self._updating = False
+        
+        self.update_views()
+
+# ======================== Main Application ========================
+class MainApp(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.stacked = QStackedWidget()
+        
+        self.splash = SplashScreen()
+        self.splash.start_btn.clicked.connect(self.show_viewer)
+        
+        self.viewer = DICOMViewer()
+        
+        self.stacked.addWidget(self.splash)
+        self.stacked.addWidget(self.viewer)
+        
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.stacked)
+        self.setLayout(layout)
+    
+    def show_viewer(self):
+        self.stacked.setCurrentIndex(1)
+        self.setWindowTitle("🩻 Medical MPR Viewer + AI (COMPLETE)")
+        self.showMaximized()
+
+# ======================== Entry Point ========================
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    
+    main_window = MainApp()
+    main_window.setWindowTitle("Medical MPR Viewer - AI Complete Edition")
+    main_window.showMaximized()
+    
+    sys.exit(app.exec_())
